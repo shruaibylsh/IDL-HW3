@@ -274,6 +274,8 @@ class ASRTrainer(BaseTrainer):
                         self._save_attention_plot(train_attn[last_cross_key][0], epoch, "decoder_cross")
             
             # Save generated text
+            if self.use_wandb and self.wandb_run is not None:
+                self.wandb_run.log({}, step = epoch, commit=True)
             self._save_generated_text(val_results, f'val_epoch_{epoch}')
             
             # Save checkpoints
