@@ -119,7 +119,7 @@ class MultiHeadAttention(nn.Module):
         attn_weights = scores.softmax(dim=-1)
 
         # TODO: Apply the attention weights to the values
-        attn_output = attn_weights @ v
+        attn_output = self.dropout(attn_weights) @ v
 
         # TODO: Merge the heads
         attn_output = self._concat_heads(attn_output)
