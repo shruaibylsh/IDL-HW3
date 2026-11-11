@@ -381,7 +381,7 @@ class ASRTrainer(BaseTrainer):
                 feat_lengths = feat_lengths.to(self.device)
                 
                 # TODO: Encode speech features to hidden states
-                encoder_output, pad_mask_src, _, _ = self.model.encode(feats, feat_lengths)
+                encoder_output, pad_mask_src, _, ctc_inputs = self.model.encode(feats, feat_lengths)
                 
                 # Define scoring function for this batch
                 def get_score(x):
@@ -399,15 +399,21 @@ class ASRTrainer(BaseTrainer):
                     # TODO: If you have implemented beam search, generate sequences using beam search
                     seqs, scores = generator.generate_beam(prompts, recognition_config["beam_width"], recognition_config["temperature"], recognition_config["repeat_penalty"],)
 
-                    # Pick best beam
-                    seqs = seqs[:, 0, :]
-                    scores = scores[:, 0]
+                    lam = recognition_config.get('ctc_weight', 0.0)
+                    if lam > 0:
+                        # Re-rank the beam candidates with attention + CTC scores
+                        seqs, scores = self._ctc_rescore(seqs, scores, ctc_inputs, lam,
+                                                         recognition_config.get('length_bonus', 0.0))
+                    else:
+                        # Pick best beam
+                        seqs = seqs[:, 0, :]
+                        scores = scores[:, 0]
                 else:
                     # TODO: Generate sequences using greedy search                      
                     seqs, scores = generator.generate_greedy(prompts, recognition_config["temperature"], recognition_config["repeat_penalty"])
 
                 # Clean up
-                del feats, feat_lengths, encoder_output, pad_mask_src, prompts
+                del feats, feat_lengths, encoder_output, pad_mask_src, prompts, ctc_inputs
                 torch.cuda.empty_cache()
 
                 # Post process sequences
@@ -436,6 +442,41 @@ class ASRTrainer(BaseTrainer):
 
             batch_bar.close()
             return results
+
+    def _ctc_rescore(self, seqs, att_scores, ctc_inputs, lam, beta=0.0):
+        """
+        Re-rank beam candidates with the CTC head.
+
+        Args:
+            seqs: (batch_size, beam_width, seq_len) beam candidates, starting with SOS
+            att_scores: (batch_size, beam_width) attention decoder log-probabilities
+            ctc_inputs: dict from model.encode with 'log_probs' (T, B, V) and 'lengths' (B,)
+            lam: weight of the CTC score, final = (1 - lam) * attention + lam * CTC
+            beta: bonus per output token (counteracts any preference for short outputs)
+        Returns:
+            best sequences (batch_size, seq_len) and their combined scores (batch_size,)
+        """
+        B, K, L = seqs.shape
+        hyps = seqs[:, :, 1:]                                   # drop SOS
+        is_eos = hyps.eq(self.tokenizer.eos_id)
+        first_eos = is_eos.long().argmax(-1)
+        # Length including EOS, because the CTC head was trained on targets ending in EOS
+        hyp_len = torch.where(is_eos.any(-1), first_eos + 1, torch.full_like(first_eos, L - 1))
+
+        log_probs = ctc_inputs['log_probs'].float()             # (T, B, V)
+        in_len = ctc_inputs['lengths']
+        ctc_scores = torch.empty_like(att_scores)
+        for k in range(K):
+            # zero_infinity=False: an impossible candidate gets score -inf instead of 0 (which would win)
+            nll = F.ctc_loss(log_probs, hyps[:, k], in_len, hyp_len[:, k],
+                             blank=self.tokenizer.pad_id, reduction='none', zero_infinity=False)
+            ctc_scores[:, k] = -nll
+
+        total = (1 - lam) * att_scores + lam * ctc_scores + beta * hyp_len.float()
+        total = torch.nan_to_num(total, nan=float('-inf'))
+        best = total.argmax(dim=1)
+        idx = torch.arange(B, device=seqs.device)
+        return seqs[idx, best], total[idx, best]
 
     def _get_evaluation_recognition_configs(self) -> Dict[str, Dict[str, Any]]:
         """
